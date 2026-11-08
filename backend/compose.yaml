@@ -1,0 +1,30 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      LT_PUBLIC_ORIGIN: https://${LECTURE_DOMAIN:?请设置域名}
+      LT_ACCESS_TOKEN: ${LT_ACCESS_TOKEN:?请设置至少24字符的随机口令}
+      LT_FRONTEND_ORIGIN: ${LT_FRONTEND_ORIGIN:-}
+    volumes:
+      - ./data:/app/data
+      - ./runtime-config:/app/settings
+    expose:
+      - "8765"
+  gateway:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      LECTURE_DOMAIN: ${LECTURE_DOMAIN:?请设置域名}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+volumes:
+  caddy_data:
+  caddy_config:

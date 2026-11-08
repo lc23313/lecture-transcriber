@@ -1,0 +1,9 @@
+.venv
+data
+work
+tests
+config.json
+.env
+runtime-config
+*.zip
+__pycache__

@@ -1,0 +1,8 @@
+**/.venv/
+**/data/
+**/work/
+**/config.json
+**/.env
+**/runtime-config/
+**/__pycache__/
+**/.test-temp/

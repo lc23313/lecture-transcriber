@@ -1,0 +1,8 @@
+{
+  "api_key": "",
+  "workspace_id": "",
+  "region": "cn-beijing",
+  "llm_model": "qwen-plus",
+  "llm_base_url": "",
+  "llm_api_key": ""
+}

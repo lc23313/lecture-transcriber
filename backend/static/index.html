@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Lecture Transcriber</title>
+  <link rel="stylesheet" href="./static/style.css">
+  <script defer src="./static/connection.js"></script>
+  <script defer src="./static/app.js"></script>
+  <script defer src="./static/workspace.js"></script>
+  <script type="module" src="./static/recorder.js"></script>
+  <link rel="manifest" href="./static/manifest.webmanifest">
+  <meta name="theme-color" content="#246249">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <link rel="apple-touch-icon" href="./static/icon-180.png">
+</head>
+<body>
+<header><div><h1>Lecture Transcriber</h1><small>学术讲座 · 完整原始稿</small></div><span class="muted">电脑版 / 本机保存</span></header>
+<nav class="topnav"><button data-page="workspace">讲座工作台</button><button data-page="record">现场录音</button><button data-page="settings">API 设置</button></nav>
+<main>
+  <aside class="panel">
+    <h2>我的音频</h2>
+    <div class="drop">
+      <label class="file">＋ 导入音频<input id="file" type="file" accept=".aac,.amr,.avi,.flac,.flv,.m4a,.mkv,.mov,.mp3,.mp4,.mpeg,.ogg,.opus,.wav,.webm,.wma,.wmv"></label>
+      <p class="info">MP3 / M4A / WAV 等，最大 1 GB<br>导入仅保存到这台电脑</p>
+      <div id="importProgress" class="import-progress" hidden>
+        <div class="progress-heading"><span id="importLabel">保存到本机</span><strong id="importPercent">0%</strong></div>
+        <div id="importBar" class="bar" role="progressbar" aria-label="保存到本机" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+        <div id="importMeta" class="progress-meta"></div>
+      </div>
+    </div>
+    <div id="list"></div>
+  </aside>
+  <section class="panel">
+    <div id="config" class="notice">正在检查配置…</div>
+    <div id="connection" class="notice error" role="status" hidden>暂时无法获取任务状态，请检查本机程序是否运行。下面保留最后一次获取的进度。</div>
+    <div id="empty" class="empty">导入一份讲座音频，开始生成完整稿。<br><small>忠实保留识别结果，不自动整理或翻译。</small></div>
+    <div id="detail" hidden>
+      <h2 id="name"></h2>
+      <details class="section-box"><summary>讲座信息</summary><div class="field-grid"><label>讲座名称<input id="projectTitle"></label><label>录音日期<input id="projectDate" type="date"></label><label class="wide">讲座主题<input id="projectTopic" placeholder="填写主题后，转录前自动生成术语，无需确认"></label></div><label><input id="diarization" type="checkbox"> 启用正式说话人分离（单声道，官方建议不超过两小时）</label><button id="saveProject">保存讲座信息</button><button id="again">保留版本并重新识别</button></details>
+      <div id="state" class="info" aria-live="polite"></div>
+      <div id="error" class="error" role="status"></div>
+      <div class="progress-grid">
+        <section class="progress-card">
+          <div class="progress-heading"><h3>01 <span>上传音频</span></h3><strong id="cloudPercent">待上传</strong></div>
+          <div id="cloudBar" class="bar" role="progressbar" aria-label="上传音频" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+          <div id="cloudLabel" class="progress-label">音频已在本机，尚未发送</div>
+          <div id="cloudMeta" class="progress-meta"></div>
+        </section>
+        <section class="progress-card">
+          <div class="progress-heading"><h3>02 <span>识别完整稿</span></h3><strong id="recognitionValue">待开始</strong></div>
+          <div id="recognitionBar" class="bar" role="progressbar" aria-label="识别完整稿" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+          <div id="recognitionLabel" class="progress-label">上传完成后开始识别</div>
+          <div id="recognitionMeta" class="progress-meta"></div>
+        </section>
+      </div>
+      <div class="toolbar"><button id="start" class="primary">临时上传并转录</button></div>
+      <p class="info">仅在点击转录后发送这份音频。使用百炼临时上传，无需配置自有 OSS；临时文件约 48 小时自动清理，应用无法提前删除。此通道仅供开发测试。识别可能产生费用，本机原音频始终保留。</p>
+      <div class="toolbar">
+        <select id="version" hidden aria-label="旧版稿件"><option value="original">原始识别稿</option><option value="edited">编辑稿</option></select>
+        <select id="revision" aria-label="稿件历史版本"></select><button id="editVersion">编辑此版本</button>
+        <button id="save">保存编辑稿</button><button id="txt">导出 TXT</button><button id="md">导出 Markdown</button><button id="json">导出稿件 JSON</button>
+      </div>
+      <div class="toolbar"><label><input id="includeTime" type="checkbox"> 导出时间戳</label><label><input id="includeSpeaker" type="checkbox"> 导出说话人</label><label><input id="paragraphMode" type="checkbox" checked> 段落视图</label><button id="lightTidy">轻度整理</button><button id="deepTidy">深度整理</button><button id="showDiff">与来源版本比较</button></div>
+      <div id="aiActions" class="info" role="status"></div>
+      <div id="paragraphs"></div>
+      <textarea id="text" readonly aria-label="完整稿内容" placeholder="识别完成后，完整文字将在这里显示。"></textarea>
+      <pre id="diff" hidden></pre>
+      <details class="section-box"><summary>专业词汇表</summary><p class="info">词汇仅作识别辅助，不强制替换原话。权重 1–5；更改应用于新任务和下次实时连接。</p><div id="vocabStatus" class="info"></div><div id="vocabEntries"></div><button id="addVocab">添加词条</button><button id="saveVocab">保存词汇表</button><button id="generateVocab">根据主题重新生成</button><label>领域背景<textarea id="vocabBackground" class="short"></textarea></label><label>上下文（最多400字）<textarea id="vocabContext" maxlength="400" class="short"></textarea></label></details>
+      <details class="section-box"><summary>说话人</summary><div id="speakerEntries"></div><button id="saveSpeakers">保存说话人名称</button><p class="info">实时阶段不区分说话人；完整音频识别后正式编号。不同任务的编号不自动认定为同一人。</p></details>
+      <div class="toolbar"><button id="backupProject">导出完整项目备份</button><button id="downloadAudio">导出原音频</button></div>
+      <p class="info">原始识别稿始终保留。编辑稿需点击保存；每次保存均保留本地历史快照。不自动润色或翻译，请结合原音频核对。默认仅识别第一音轨，不启用说话人分离。</p>
+    </div>
+  </section>
+</main>
+<section id="recordPage" class="page-panel" hidden>
+  <h2>现场录音</h2><p class="info">iPhone 请在 Safari 中“添加到主屏幕”。只支持前台录音；后台、锁屏和系统中断可能停止录音，真实 iPhone 尚待验收。</p>
+  <div class="field-grid"><label>讲座名称<input id="recordTitle" placeholder="现场录音"></label><label>讲座主题<input id="recordTopic" placeholder="用于自动生成专业词汇"></label></div>
+  <label><input id="enableLive" type="checkbox"> 开启实时识别（会通过后端发送实时音频，可能产生费用）</label>
+  <div class="record-clock"><strong id="recordDuration">0:00</strong><span id="recordState">尚未开始</span></div>
+  <div class="health-grid"><div id="recordNetwork">检查网络…</div><div id="recordSave">暂无音频片段</div><div id="recordLive">实时识别未开启</div><div id="recordWake">录音时会尝试请求屏幕常亮</div></div>
+  <div id="recordNotice" class="notice" role="status">每个片段在本地数据库确认保存后，才显示已保存。</div>
+  <div class="toolbar"><button id="startRecord" class="primary">开始录音</button><button id="pauseRecord" disabled>暂停</button><button id="stopRecord" disabled>结束录音</button><button id="emergencyAudio">导出未保存的内存片段</button><select id="liveMode" aria-label="实时稿显示模式"><option value="subtitle">字幕模式</option><option value="document">文档模式</option></select></div>
+  <div id="liveSubtitle" class="subtitle" aria-live="polite">等待识别文字…</div><pre id="liveDocument" class="live-document" hidden></pre>
+  <div id="recordTransfer" class="info" role="status"></div><h3>本机录音与恢复</h3><p class="info">浏览器存储可能被系统清理，请及时导出音频；异常退出恢复不保证末尾片段可播放。这里不会自动删除片段。</p><div id="localRecordings"></div>
+  <label class="file">恢复录音备份（选择音频及录音信息 JSON）<input id="restoreRecording" type="file" multiple accept="audio/*,.json,.webm,.m4a,.wav"></label>
+</section>
+<section id="settingsPage" class="page-panel" hidden>
+  <section id="backendConnection" hidden><h2>连接私人转录后端</h2><p class="info">GitHub Pages 只托管网页。本地录音、保存和导出无需后端；实时识别、完整转录和整理需要另外运行的 HTTPS 后端。此处不填写百炼 API Key。</p><label>HTTPS 后端地址<input id="backendAddress" type="url" placeholder="https://backend.example.com"></label><button id="saveBackend">保存后端地址</button><button id="disconnectBackend">断开后端</button><div id="backendStatus" class="info"></div><hr></section>
+  <h2>API 设置</h2><p class="info">密钥保存在后端，不返回给浏览器。留空密钥表示保留现有配置。</p>
+  <div class="field-grid"><label>百炼 Workspace ID<input id="settingWorkspace"></label><label>地域<select id="settingRegion"><option value="cn-beijing">北京</option><option value="ap-southeast-1">新加坡</option></select></label><label>百炼 API Key<input id="settingKey" type="password" autocomplete="new-password"></label><label>整理 / 词汇模型<input id="settingModel" placeholder="填写你开通的 LLM 模型 ID"></label><label>可选 LLM Base URL<input id="settingBase" placeholder="默认使用百炼兼容接口"></label><label>可选 LLM API Key<input id="settingLlmKey" type="password" autocomplete="new-password"></label></div><button id="saveSettings">保存设置</button>
+  <hr><h3>手动迁移与恢复</h3><p class="info">在设备间手动传输备份，不自动云同步。录音页面可直接导出本机音频；工作台可导出完整项目 ZIP。</p><label class="file">恢复项目备份<input type="file" id="restoreProject" accept=".zip"></label><div id="restoreStatus" class="info"></div>
+  <hr><h3>设备能力与真机验收</h3><button id="deviceCheck">检查并导出设备能力报告</button><pre id="deviceReport"></pre><p class="info">能力检测不等于长时间录音验收。iPhone 需实际检查麦克风、暂停继续、断网、锁屏中断、存储失败和片段恢复。</p>
+</section>
+<dialog id="loginDialog"><h2>私人访问</h2><label>访问口令<input id="accessToken" type="password" autocomplete="current-password"></label><button id="loginButton">登录</button><div id="loginError" class="error"></div></dialog>
+<div id="message" role="status" hidden></div>
+</body>
+</html>
