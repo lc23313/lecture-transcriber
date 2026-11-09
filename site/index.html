@@ -15,21 +15,21 @@
   <link rel="apple-touch-icon" href="./static/icon-180.png">
 </head>
 <body>
-<header><div><h1>Lecture Transcriber</h1><small>学术讲座 · 完整原始稿</small></div><span class="muted">电脑版 / 本机保存</span></header>
+<header><div><h1>Lecture Transcriber</h1><small>学术讲座 · 完整原始稿</small></div><span class="muted">个人讲座工作台</span></header>
 <nav class="topnav"><button data-page="workspace">讲座工作台</button><button data-page="record">现场录音</button><button data-page="settings">API 设置</button></nav>
 <main>
   <aside class="panel">
     <h2>我的音频</h2>
     <div class="drop">
       <label class="file">＋ 导入音频<input id="file" type="file" accept=".aac,.amr,.avi,.flac,.flv,.m4a,.mkv,.mov,.mp3,.mp4,.mpeg,.ogg,.opus,.wav,.webm,.wma,.wmv"></label>
-      <p class="info">MP3 / M4A / WAV 等，最大 1 GB<br>导入仅保存到这台电脑</p>
+      <p class="info">MP3 / M4A / WAV 等，最大 1 GB<br>保存在当前连接的后端；未连接时保存在当前设备</p>
       <div id="importProgress" class="import-progress" hidden>
         <div class="progress-heading"><span id="importLabel">保存到本机</span><strong id="importPercent">0%</strong></div>
         <div id="importBar" class="bar" role="progressbar" aria-label="保存到本机" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
         <div id="importMeta" class="progress-meta"></div>
       </div>
     </div>
-    <div id="list"></div>
+    <div id="list"></div><button id="moreProjects">加载更多讲座</button>
   </aside>
   <section class="panel">
     <div id="config" class="notice">正在检查配置…</div>
@@ -57,19 +57,18 @@
       <div class="toolbar"><button id="start" class="primary">临时上传并转录</button></div>
       <p class="info">仅在点击转录后发送这份音频。使用百炼临时上传，无需配置自有 OSS；临时文件约 48 小时自动清理，应用无法提前删除。此通道仅供开发测试。识别可能产生费用，本机原音频始终保留。</p>
       <div class="toolbar">
-        <select id="version" hidden aria-label="旧版稿件"><option value="original">原始识别稿</option><option value="edited">编辑稿</option></select>
         <select id="revision" aria-label="稿件历史版本"></select><button id="editVersion">编辑此版本</button>
         <button id="save">保存编辑稿</button><button id="txt">导出 TXT</button><button id="md">导出 Markdown</button><button id="json">导出稿件 JSON</button>
       </div>
       <div class="toolbar"><label><input id="includeTime" type="checkbox"> 导出时间戳</label><label><input id="includeSpeaker" type="checkbox"> 导出说话人</label><label><input id="paragraphMode" type="checkbox" checked> 段落视图</label><button id="lightTidy">轻度整理</button><button id="deepTidy">深度整理</button><button id="showDiff">与来源版本比较</button></div>
-      <div id="aiActions" class="info" role="status"></div>
+      <div class="toolbar"><button id="restoreDraft" hidden>恢复本地未提交草稿</button><span id="draftStatus" class="info"></span></div><div id="aiActions" class="info" role="status"></div>
       <div id="paragraphs"></div>
       <textarea id="text" readonly aria-label="完整稿内容" placeholder="识别完成后，完整文字将在这里显示。"></textarea>
-      <pre id="diff" hidden></pre>
+      <pre id="diff" hidden></pre><pre id="modelRuns" hidden></pre>
       <details class="section-box"><summary>专业词汇表</summary><p class="info">词汇仅作识别辅助，不强制替换原话。权重 1–5；更改应用于新任务和下次实时连接。</p><div id="vocabStatus" class="info"></div><div id="vocabEntries"></div><button id="addVocab">添加词条</button><button id="saveVocab">保存词汇表</button><button id="generateVocab">根据主题重新生成</button><label>领域背景<textarea id="vocabBackground" class="short"></textarea></label><label>上下文（最多400字）<textarea id="vocabContext" maxlength="400" class="short"></textarea></label></details>
       <details class="section-box"><summary>说话人</summary><div id="speakerEntries"></div><button id="saveSpeakers">保存说话人名称</button><p class="info">实时阶段不区分说话人；完整音频识别后正式编号。不同任务的编号不自动认定为同一人。</p></details>
-      <div class="toolbar"><button id="backupProject">导出完整项目备份</button><button id="downloadAudio">导出原音频</button></div>
-      <p class="info">原始识别稿始终保留。编辑稿需点击保存；每次保存均保留本地历史快照。不自动润色或翻译，请结合原音频核对。默认仅识别第一音轨，不启用说话人分离。</p>
+      <div class="toolbar"><button id="backupProject">导出完整项目备份</button><button id="downloadAudio">导出原音频</button><button id="stopWaiting">停止本地等待</button><button id="deleteProject">删除项目</button><button id="showRuns">查看模型调用记录</button></div>
+      <p class="info">原始识别稿始终保留。编辑稿需点击保存；每次保存均保留本地历史快照。不自动润色或翻译，请结合原音频核对。识别前校验音频并将所有音轨、声道混合为无损单声道副本，原音频保留。重叠讲话仍可能难以辨认。默认不启用说话人分离。</p>
     </div>
   </section>
 </main>
@@ -82,7 +81,7 @@
   <div id="recordNotice" class="notice" role="status">每个片段在本地数据库确认保存后，才显示已保存。</div>
   <div class="toolbar"><button id="startRecord" class="primary">开始录音</button><button id="pauseRecord" disabled>暂停</button><button id="stopRecord" disabled>结束录音</button><button id="emergencyAudio">导出未保存的内存片段</button><select id="liveMode" aria-label="实时稿显示模式"><option value="subtitle">字幕模式</option><option value="document">文档模式</option></select></div>
   <div id="liveSubtitle" class="subtitle" aria-live="polite">等待识别文字…</div><pre id="liveDocument" class="live-document" hidden></pre>
-  <div id="recordTransfer" class="info" role="status"></div><h3>本机录音与恢复</h3><p class="info">浏览器存储可能被系统清理，请及时导出音频；异常退出恢复不保证末尾片段可播放。这里不会自动删除片段。</p><div id="localRecordings"></div>
+  <div id="recordTransfer" class="info" role="status"></div><progress id="recordUploadProgress" max="100" value="0" hidden aria-label="上传到私人后端"></progress><div id="localStorageUsed" class="info"></div><h3>本机录音与恢复</h3><p class="info">浏览器存储可能被系统清理，请及时导出音频；异常退出恢复不保证末尾片段可播放。这里不会自动删除片段。</p><div id="localRecordings"></div>
   <label class="file">恢复录音备份（选择音频及录音信息 JSON）<input id="restoreRecording" type="file" multiple accept="audio/*,.json,.webm,.m4a,.wav"></label>
 </section>
 <section id="settingsPage" class="page-panel" hidden>

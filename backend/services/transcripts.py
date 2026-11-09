@@ -1,6 +1,7 @@
 import json
 import time
 import uuid
+import re
 
 def migrate(c):
     cols={r[1] for r in c.execute('PRAGMA table_info(jobs)')}
@@ -14,6 +15,9 @@ def migrate(c):
     c.execute('CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY,job TEXT,kind TEXT,status TEXT,error TEXT,created REAL,finished REAL)')
     c.execute('CREATE TABLE IF NOT EXISTS live_sentences(job TEXT,session TEXT,seq INTEGER,data TEXT,PRIMARY KEY(job,session,seq))')
     c.execute('CREATE TABLE IF NOT EXISTS live_archives(job TEXT,session TEXT,revision TEXT,PRIMARY KEY(job,session))')
+    c.execute('CREATE TABLE IF NOT EXISTS upload_parts(job TEXT,seq INTEGER,size INTEGER,hash TEXT,PRIMARY KEY(job,seq))')
+    c.execute('CREATE TABLE IF NOT EXISTS model_runs(id TEXT PRIMARY KEY,job TEXT,revision TEXT,task TEXT,model TEXT,request TEXT,raw TEXT,created REAL)')
+    c.execute('CREATE INDEX IF NOT EXISTS model_run_job ON model_runs(job,created)')
     # Backfill only missing revisions; never replace an existing saved version.
     for row in c.execute("SELECT id,original,edited,raw FROM jobs WHERE original IS NOT NULL AND NOT EXISTS(SELECT 1 FROM revisions WHERE job=jobs.id)").fetchall():
         try:raw=json.loads(row['raw'] or '{}')
@@ -29,23 +33,36 @@ def recover_live(c):
         rid=add(c,item['job'],'realtime','\n\n'.join(p.get('text','') for p in parts),parts,model='qwen-audio-3.1-asr-flash-streaming (recovered)')
         c.execute('INSERT INTO live_archives VALUES(?,?,?)',(item['job'],item['session'],rid))
 
+def join_text(left,right):
+    if left and right and re.search(r'[A-Za-z0-9]$',left) and re.match(r'[A-Za-z0-9]',right):
+        return left+' '+right
+    return left+right
+
+
 def paragraphs(raw,namespace=None):
     result=[]
     for t in raw.get('transcripts',[]):
         channel=t.get('channel_id',0)
-        for s in t.get('sentences',[]):
-            start=s.get('begin_time')
-            end=s.get('end_time')
-            if start is None or end is None:
-                continue
+        sentences=t.get('sentences') or [{'text':t.get('text','')}]
+        for s in sentences:
+            start=s.get('begin_time');end=s.get('end_time')
+            known=start is not None and end is not None
             speaker=None if s.get('speaker_id') is None else (str(namespace)+':' if namespace else '')+f"channel-{channel}:speaker-{s['speaker_id']}"
-            piece={'start':max(0,int(start)),'end':max(int(start),int(end)),'speaker':speaker,'channel':channel,'text':s.get('text','')}
-            if result and result[-1].get('channel')==channel and result[-1]['speaker']==speaker and 0<=piece['start']-result[-1]['end']<2000 and piece['end']-result[-1]['start']<30000 and len(result[-1]['text'])+len(piece['text'])<250:
-                result[-1]['end']=piece['end']
-                result[-1]['text']+=piece['text']
-            else:
-                result.append(piece)
+            piece={'start':max(0,int(start)) if known else None,'end':max(int(start),int(end)) if known else None,
+                   'speaker':speaker,'channel':channel,'text':s.get('text','')}
+            previous=result[-1] if result else None
+            if known and previous and previous['end'] is not None and previous.get('channel')==channel and previous['speaker']==speaker and 0<=piece['start']-previous['end']<2000 and piece['end']-previous['start']<30000 and len(previous['text'])+len(piece['text'])<250:
+                previous['end']=piece['end'];previous['text']=join_text(previous['text'],piece['text'])
+            else:result.append(piece)
+        # Preserve any aggregate-only text when sentence data is incomplete. Do not guess timestamps.
+        aggregate=t.get('text','')
+        compact=lambda text: re.sub(r'\s+','',text)
+        sentence_text=''.join(item.get('text','') for item in sentences)
+        if aggregate and compact(aggregate)!=compact(sentence_text):
+            result=[p for p in result if p['channel']!=channel]
+            result.append({'start':None,'end':None,'speaker':None,'channel':channel,'text':aggregate})
     return result
+
 
 def add(c,jid,kind,text,segments=None,parent=None,model=None):
     rid=uuid.uuid4().hex
@@ -54,6 +71,7 @@ def add(c,jid,kind,text,segments=None,parent=None,model=None):
 
 def vocabulary(value):
     """Keep a short, deduplicated relevant list; weights are hints, never replacements."""
+    if not isinstance(value,dict) or not isinstance(value.get('entries',[]),list) or any(not isinstance(e,dict) for e in value.get('entries',[])):raise ValueError('词汇表格式错误')
     entries=[];seen=set()
     for item in value.get('entries',[])[:200]:
         en=str(item.get('en','')).strip()[:100];zh=str(item.get('zh','')).strip()[:100]
@@ -78,7 +96,8 @@ def hints(value):
     return words,context
 
 def stamp(ms):
-    n=max(0,int(ms or 0)//1000)
+    if ms is None:return '时间未知'
+    n=max(0,int(ms)//1000)
     return f'{n//3600:02}:{n//60%60:02}:{n%60:02}'
 
 def export_text(revision,speakers,timestamps=False,labels=False):

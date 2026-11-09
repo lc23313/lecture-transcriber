@@ -6,6 +6,7 @@ import secrets
 import time
 import uuid
 import zipfile
+from starlette.background import BackgroundTask
 from fastapi import HTTPException,Request
 from fastapi.responses import FileResponse,Response
 from . import transcripts as T,language
@@ -30,7 +31,10 @@ def install(app,R):
             try:fn()
             except Exception as e:error=str(e) if isinstance(e,ValueError) else type(e).__name__+'：模型调用失败，请检查配置后重试'
             with R.db() as c:c.execute('UPDATE actions SET status=?,error=?,finished=? WHERE id=?',('FAILED' if error else 'SUCCEEDED',error,time.time(),aid))
-        R.POOL.submit(run)
+        try:R.AI_POOL.submit(run)
+        except Exception:
+            with R.db() as c:c.execute("UPDATE actions SET status='FAILED',error='任务启动失败',finished=? WHERE id=?",(time.time(),aid))
+            raise HTTPException(503,'任务启动失败')
         return {'id':aid}
 
     @app.patch('/api/jobs/{jid}')
@@ -47,9 +51,13 @@ def install(app,R):
         return {'ok':True}
 
     @app.get('/api/jobs/{jid}/versions')
-    def versions(jid:str):
+    def versions(jid:str,summary:bool=False):
         R.get_job(jid)
-        with R.db() as c:return [dict(r) for r in c.execute('SELECT * FROM revisions WHERE job=? ORDER BY created DESC',(jid,))]
+        columns='id,job,kind,parent,model,created' if summary else '*'
+        with R.db() as c:return [dict(r) for r in c.execute(f'SELECT {columns} FROM revisions WHERE job=? ORDER BY created DESC',(jid,))]
+
+    @app.get('/api/jobs/{jid}/versions/{rid}')
+    def version_detail(jid:str,rid:str):return revision(jid,rid)
 
     @app.post('/api/jobs/{jid}/versions')
     async def save_version(jid:str,request:Request):
@@ -73,7 +81,9 @@ def install(app,R):
 
     @app.put('/api/jobs/{jid}/vocabulary')
     async def vocab_save(jid:str,request:Request):
-        R.get_job(jid);v=T.vocabulary(await request.json())
+        R.get_job(jid)
+        try:v=T.vocabulary(await request.json())
+        except ValueError:raise HTTPException(400,'词汇表格式错误')
         R.update(jid,vocab=json.dumps(v,ensure_ascii=False),vocab_status='已保存；新任务及下次实时连接将使用')
         return v
 
@@ -125,13 +135,14 @@ def install(app,R):
         path=R.DATA/(jid+'.audio')
         if not path.exists():raise HTTPException(400,'请先从录音设备导出音频')
         # The archive is streamed from disk, without reading a large lecture into memory.
-        out=R.DATA/(jid+'.backup.zip')
+        out=R.DATA/(uuid.uuid4().hex+'.backup.zip')
         with R.db() as c:
             revs=[dict(r) for r in c.execute('SELECT * FROM revisions WHERE job=?',(jid,))]
+            runs=[dict(r) for r in c.execute('SELECT * FROM model_runs WHERE job=?',(jid,))]
         with zipfile.ZipFile(out,'w',zipfile.ZIP_STORED) as z:
-            z.writestr('project.json',json.dumps({'schema':1,'project':{k:v for k,v in j.items() if k not in ('task','object_key')},'versions':revs},ensure_ascii=False))
+            z.writestr('project.json',json.dumps({'schema':1,'project':{k:v for k,v in j.items() if k not in ('task','object_key')},'versions':revs,'runs':runs},ensure_ascii=False))
             z.write(path,'audio.bin')
-        return FileResponse(out,filename='lecture-backup.zip')
+        return FileResponse(out,filename='lecture-backup.zip',background=BackgroundTask(out.unlink,missing_ok=True))
 
     @app.post('/api/restore')
     async def restore(request:Request):
@@ -159,6 +170,8 @@ def install(app,R):
                         c.execute('INSERT INTO jobs(id,name,status,created,title,topic,recorded_at,vocab,speakers,original,edited,raw) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(nid,str(j['name'])[:200],'SUCCEEDED' if j.get('original') is not None else 'LOCAL',time.time(),j.get('title'),j.get('topic',''),j.get('recorded_at'),j.get('vocab','{}'),j.get('speakers','{}'),j.get('original'),j.get('edited'),j.get('raw')))
                         ids={v['id']:uuid.uuid4().hex for v in revs}
                         for v in revs:c.execute('INSERT INTO revisions VALUES(?,?,?,?,?,?,?,?)',(ids[v['id']],nid,v['kind'],v['text'],v['segments'],ids.get(v.get('parent')),v.get('model'),v['created']))
+                        for run in data.get('runs',[]):
+                            c.execute('INSERT INTO model_runs VALUES(?,?,?,?,?,?,?,?)',(uuid.uuid4().hex,nid,ids.get(run.get('revision')),run.get('task'),run['model'],run['request'],run.get('raw'),run['created']))
                 except BaseException:
                     (R.DATA/(nid+'.audio')).unlink(missing_ok=True);raise
             return {'id':nid}
@@ -206,6 +219,9 @@ def install(app,R):
         except (OSError,ValueError):old={}
         for key in ('api_key','workspace_id','region','llm_model','llm_base_url','llm_api_key'):
             if key in b and (b[key] or 'key' not in key):old[key]=str(b[key]).strip()
+        if old.get('llm_base_url'):
+            default=f"https://{old.get('workspace_id')}.{old.get('region')}.maas.aliyuncs.com/compatible-mode/v1"
+            if old['llm_base_url'].rstrip('/')!=default and not old.get('llm_api_key'):raise HTTPException(400,'自定义 LLM 地址必须填写独立 LLM API Key')
         R.CONFIG_FILE.parent.mkdir(parents=True,exist_ok=True)
-        tmp=R.CONFIG_FILE.with_suffix('.json.tmp');tmp.write_text(json.dumps(old,indent=2),encoding='utf-8');tmp.replace(R.CONFIG_FILE)
+        tmp=R.CONFIG_FILE.with_name(uuid.uuid4().hex+'.config.tmp');tmp.write_text(json.dumps(old,indent=2),encoding='utf-8');tmp.replace(R.CONFIG_FILE)
         return {'ok':True}

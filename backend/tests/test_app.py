@@ -120,14 +120,14 @@ class AppTests(unittest.TestCase):
                     out={'task_status':'SUCCEEDED','results':[{'subtask_status':'FAILED'}]}
                 return app.httpx.Response(200,json={'output':out})
             return app.httpx.Response(200,json={'transcripts':[{'text':'Hello，呃，世界。'}]})
-        with patch.object(app,'config',return_value=CFG),patch.object(app,'update',side_effect=record),patch.object(app.time,'sleep'),patch.object(app.httpx,'Client',side_effect=lambda **kw:CLIENT(transport=app.httpx.MockTransport(handler),**kw)):
+        with patch.object(app.audio,'prepare',side_effect=lambda src,dst:(dst.write_bytes(src.read_bytes()) and {'tracks':1})),patch.object(app,'config',return_value=CFG),patch.object(app,'update',side_effect=record),patch.object(app.time,'sleep'),patch.object(app.httpx,'Client',side_effect=lambda **kw:CLIENT(transport=app.httpx.MockTransport(handler),**kw)):
             app.worker(jid)
         return events
 
     def test_worker_reports_stages_and_only_completes_after_save(self):
         jid=self.upload()
         events=self.run_worker(jid)
-        self.assertEqual(events,['UPLOADING','SUBMITTING','PENDING','PENDING','RUNNING','FETCHING_RESULT','SUCCEEDED'])
+        self.assertEqual(events,['WAITING_UPLOAD','UPLOADING','SUBMITTING','PENDING','PENDING','RUNNING','FETCHING_RESULT'])
         job=app.get_job(jid)
         self.assertEqual(job['original'],'Hello，呃，世界。')
         self.assertTrue(job['finished']>=job['recognition_started'])

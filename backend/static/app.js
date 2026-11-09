@@ -3,7 +3,7 @@ const $ = id => document.getElementById(id);
 const BUSY = new Set(['WAITING_UPLOAD','UPLOADING','SUBMITTING','PENDING','RUNNING','FETCHING_RESULT']);
 const labels = {RECORDING:'现场录音项目',LOCAL:'已保存到本机',WAITING_UPLOAD:'等待上传',UPLOADING:'正在上传音频',SUBMITTING:'正在提交识别',PENDING:'云端排队',RUNNING:'正在识别',FETCHING_RESULT:'正在保存完整稿',SUCCEEDED:'完整稿已生成',FAILED:'处理失败',INTERRUPTED:'处理曾中断'};
 let current = null, job = null, dirty = false, connected = true, refreshing = false, starting = false;
-let serverOffset = 0, toastTimer, importing = false;
+let serverOffset = 0, toastTimer, importing = false, projectLimit=50;
 
 async function api(url, options) {
   let r;
@@ -83,15 +83,8 @@ function render(reset) {
   $('start').disabled=running||starting;
   $('start').textContent=running?'正在处理…':job.task?'继续查询已有任务':job.status==='FAILED'?'重新上传并转录':'临时上传并转录';
   if (reset||!dirty) {
-    if(window.renderVersion) window.renderVersion(reset);
-    else {
-    const editable=$('version').value==='edited';
-    $('text').readOnly=!editable||job.status!=='SUCCEEDED';
-    $('text').value=editable?(job.edited??job.original??''):(job.original??'');
-    }
+    window.renderVersion?.(reset);
   }
-  $('save').disabled=$('version').value!=='edited'||job.status!=='SUCCEEDED';
-  for (const ext of ['txt','md','json']) $(ext).disabled=job.status!=='SUCCEEDED';
   if(window.renderWorkspace)window.renderWorkspace(reset);
   renderProgress();
 }
@@ -103,8 +96,9 @@ async function refresh() {
   if (refreshing) return;
   refreshing=true;
   try {
-    const rows=await api('/api/jobs');
-    window.cacheProjectRows?.(rows);
+    const pages=await Promise.all(Array.from({length:Math.ceil(projectLimit/200)},(_,i)=>api(`/api/jobs?limit=${Math.min(200,projectLimit-i*200)}&offset=${i*200}`)));const rows=pages.flat();
+    $('moreProjects').hidden=rows.length<projectLimit;
+    window.cacheProjectRows?.(rows).catch(()=>{});
     $('list').replaceChildren();
     for (const r of rows) {
       const b=document.createElement('button'); b.className='item'+(current===r.id?' selected':'');
@@ -129,14 +123,14 @@ async function openJob(id) {
   if (dirty&&!confirm('编辑内容尚未保存，是否放弃？')) return;
   try {
     const next=await api('/api/jobs/'+id);
-    current=id; dirty=false; connected=true; acceptJob(next); render(true);
+    current=id;localStorage.setItem('lecture-selected:'+window.ltBackend(),id); dirty=false; connected=true; acceptJob(next); render(true);
     await refresh();
-  } catch (e) { toast(e.message); }
+  } catch (e) {if(!await window.openOfflineProject?.(id))toast(e.message);}
 }
 function importFile(file) {
   if(window.ltStaticHost&&!window.ltConnected())return import(window.ltAsset('static/local-db.js')).then(async db=>{
     const id=crypto.randomUUID();const meta={id,title:file.name,name:file.name,mime:file.type,created:new Date().toISOString(),state:'imported',duration:0,seq:1,bytes:file.size,live:[]};
-    await db.saveChunk(meta,file,0);return {local:true,id};
+    await db.saveAudio(meta,file,(sent,total)=>{const percent=Math.min(99,Math.floor(sent/total*100));$('importPercent').textContent=percent+'%';bar('importBar',percent);});return {local:true,id};
   });
   return new Promise((resolve,reject)=>{
     const xhr=new XMLHttpRequest();
@@ -147,7 +141,7 @@ function importFile(file) {
       const p=Math.min(99,Math.floor(e.loaded/e.total*100));
       $('importPercent').textContent=p+'%';
       $('importMeta').textContent=`${bytes(e.loaded)} / ${bytes(e.total)}`;
-      $('importLabel').textContent=e.loaded>=e.total?'等待本机保存确认…':'正在保存到本机';
+      $('importLabel').textContent=e.loaded>=e.total?'等待本机保存确认…':(window.ltStaticHost&&window.ltConnected()?'正在上传到私人后端':'正在保存到当前设备');
       bar('importBar',p,{text:$('importLabel').textContent});
     };
     xhr.onload=()=>{
@@ -166,7 +160,7 @@ $('file').onchange=async e=>{
   if (f.size>1_000_000_000) { toast('临时上传支持的音频上限为 1 GB，请选择更小的文件'); $('file').value=''; return; }
   if (!f.size) { toast('文件为空'); $('file').value=''; return; }
   importing=true; $('file').disabled=true; $('importProgress').hidden=false;
-  $('importPercent').textContent='0%'; $('importLabel').textContent='正在保存到本机';
+  $('importPercent').textContent='0%'; $('importLabel').textContent=(window.ltStaticHost&&window.ltConnected()?'正在上传到私人后端':'正在保存到当前设备');
   $('importMeta').textContent=`0 KB / ${bytes(f.size)}`; bar('importBar',0);
   try {
     const r=await importFile(f);
@@ -193,28 +187,10 @@ $('start').onclick=async()=>{
   finally { starting=false; render(false); }
 };
 $('text').oninput=()=>dirty=true;
-$('version').onchange=()=>{
-  if (dirty&&!confirm('编辑内容尚未保存，是否放弃？')) { $('version').value='edited'; return; }
-  dirty=false; render(true);
-};
-$('save').onclick=async()=>{
-  const id=current, text=$('text').value;
-  try {
-    await api('/api/jobs/'+id+'/edit',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
-    if (id===current&&text===$('text').value) dirty=false;
-    toast('编辑稿及历史快照已保存'); await refresh();
-  } catch(e) { toast(e.message); }
-};
-function download(ext) {
-  if (!job||job.status!=='SUCCEEDED') return toast('请等待识别完成');
-  let text=ext==='json'?JSON.stringify({...job,exported_at:new Date().toISOString()},null,2):$('text').value;
-  if(ext==='md') text='# '+job.name+'\n\n'+text;
-  const url=URL.createObjectURL(new Blob([ext==='txt'?'\uFEFF'+text:text],{type:'text/plain;charset=utf-8'}));
-  const a=document.createElement('a'); a.href=url; a.download=job.name+'.'+ext; a.click();
-  setTimeout(()=>URL.revokeObjectURL(url),1000);
-}
-for (const ext of ['txt','md','json']) $(ext).onclick=()=>download(ext);
 window.onbeforeunload=e=>{ if(dirty||importing){e.preventDefault();e.returnValue='';} };
-refresh().then(rows=>{if(rows?.length&&!current)openJob(rows.find(r=>r.active)?.id||rows[0].id);});
-setInterval(refresh,1000);
+refresh().then(rows=>{if(rows?.length&&!current)openJob(rows.find(r=>r.active)?.id||rows.find(r=>r.id===localStorage.getItem('lecture-selected:'+window.ltBackend()))?.id||rows[0].id);});
+$('moreProjects').onclick=()=>{projectLimit+=50;refresh();};
+async function scheduleRefresh(){await refresh();setTimeout(scheduleRefresh,document.hidden?60000:job?.active?2000:15000);}
+setTimeout(scheduleRefresh,2000);
+window.addEventListener('focus',()=>refresh());
 setInterval(renderProgress,1000);

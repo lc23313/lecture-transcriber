@@ -1,5 +1,5 @@
 'use strict';
-let versions=[],selectedRevision=null,editingVersion=false,loadedProject=null,vocabularyDirty=false,lastVocab='',workspaceLoading=false;
+let versions=[],selectedRevision=null,editingVersion=false,loadedProject=null,vocabularyDirty=false,lastVocab='',workspaceLoading=false,aiRunning=false,lastPaint='';
 const versionLabels={realtime:'实时初稿',filetrans:'完整音频原稿',user_raw:'用户编辑原稿',tidy_light:'轻度整理',tidy_deep:'深度整理',tidy_edit:'编辑后的整理稿'};
 function page(name){document.querySelector('main').hidden=name!=='workspace';$('recordPage').hidden=name!=='record';$('settingsPage').hidden=name!=='settings';document.querySelectorAll('[data-page]').forEach(b=>b.setAttribute('aria-current',b.dataset.page===name?'page':'false'));}
 document.querySelectorAll('[data-page]').forEach(b=>b.onclick=()=>page(b.dataset.page));page('workspace');
@@ -7,14 +7,15 @@ function jsonValue(s,fallback){try{return JSON.parse(s||'');}catch{return fallba
 function selectedSegments(){return selectedRevision?jsonValue(selectedRevision.segments,[]):[];}
 window.renderVersion=function(reset){
   if(!job)return;
-  if(loadedProject!==job.id){loadedProject=job.id;selectedRevision=null;editingVersion=false;versions=[];vocabularyDirty=false;lastVocab='';$('revision').replaceChildren();loadWorkspace(true);}
+  if(loadedProject!==job.id){loadedProject=job.id;window.checkLocalDraft?.();selectedRevision=null;editingVersion=false;versions=[];vocabularyDirty=false;lastVocab='';$('revision').replaceChildren();loadWorkspace(true);}
   if(dirty&&!reset)return;
-  const v=selectedRevision,parts=selectedSegments();$('text').value=v?.text||job.original||'';$('text').readOnly=!editingVersion;
+  const v=selectedRevision,parts=selectedSegments();
+  const paintKey=JSON.stringify([job.id,v?.id,v?.text===undefined,v?.segments?.length,editingVersion,$('paragraphMode').checked,job.speakers]);if(!reset&&lastPaint===paintKey)return;lastPaint=paintKey;$('text').value=v?.text||job.original||'';$('text').readOnly=!editingVersion;
   $('paragraphs').replaceChildren();const paragraphView=$('paragraphMode').checked&&parts.length>0;
   $('text').hidden=paragraphView;
   if(paragraphView)for(const p of parts){
     const box=document.createElement('div');box.className='paragraph';const heading=document.createElement('div');heading.className='meta';
-    const speakers=jsonValue(job.speakers,{});heading.textContent=duration(p.start/1000)+' – '+duration(p.end/1000)+(p.speaker?' · '+(speakers[p.speaker]||p.speaker):'');
+    const speakers=jsonValue(job.speakers,{});heading.textContent=(p.start==null||p.end==null?'时间未知':duration(p.start/1000)+' – '+duration(p.end/1000))+(p.speaker?' · '+(speakers[p.speaker]||p.speaker):'');
     const field=document.createElement(editingVersion?'textarea':'p');if(editingVersion){field.value=p.text;field.oninput=()=>dirty=true;}else field.textContent=p.text;
     box.append(heading,field);$('paragraphs').append(box);
   }
@@ -47,28 +48,30 @@ window.renderWorkspace=function(reset){
 async function loadWorkspace(newest=false){
   if(!current||workspaceLoading)return;workspaceLoading=true;const id=current;
   try{
-    const [revs,actions]=await Promise.all([api('/api/jobs/'+id+'/versions'),api('/api/jobs/'+id+'/actions')]);if(current!==id)return;
-    versions=revs;const changed=revs[0]?.id!==$('revision').options[0]?.value;
+    const [revs,actions]=await Promise.all([api('/api/jobs/'+id+'/versions?summary=true'),api('/api/jobs/'+id+'/actions')]);if(current!==id)return;
+    const cached=new Map(versions.filter(v=>v.text!==undefined).map(v=>[v.id,v]));versions=revs.map(v=>cached.get(v.id)||v);const changed=revs[0]?.id!==$('revision').options[0]?.value;
     if(!dirty&&!editingVersion){
       const previous=selectedRevision?.id;$('revision').replaceChildren();
       for(const v of revs){const option=document.createElement('option');option.value=v.id;option.textContent=(versionLabels[v.kind]||v.kind)+' · '+new Date(v.created*1000).toLocaleString();$('revision').append(option);}
-      selectedRevision=(newest||!previous)?revs[0]:revs.find(v=>v.id===previous)||revs[0];
+      selectedRevision=(newest||!previous)?versions[0]:versions.find(v=>v.id===previous)||versions[0];
+      if(selectedRevision&&selectedRevision.text===undefined){const full=await api(`/api/jobs/${id}/versions/${selectedRevision.id}`);if(current!==id)return;selectedRevision=full;versions=versions.map(v=>v.id===full.id?full:v);}
       if(selectedRevision)$('revision').value=selectedRevision.id;
       if(changed&&!previous)editingVersion=false;
       window.renderVersion(false);
     }
+    aiRunning=actions.some(a=>a.status==='RUNNING');
     $('aiActions').textContent=actions.slice(0,4).map(a=>`${a.kind}: ${a.status}${a.error?' · '+a.error:''}`).join(' / ');
     window.renderWorkspace(false);
-    if(window.localProjectStore&&job)window.localProjectStore({...job,versions:revs}).catch(()=>{});
+    if(window.localProjectStore&&job)window.localProjectStore({...job,versions:versions.filter(v=>v.text!==undefined),cachedAt:new Date().toISOString()}).catch(()=>{});
   }catch(e){if(connected)toast(e.message);}finally{workspaceLoading=false;}
 }
-$('revision').onchange=()=>{if(dirty&&!confirm('放弃未保存编辑并切换版本？')){$('revision').value=selectedRevision.id;return;}selectedRevision=versions.find(v=>v.id===$('revision').value);dirty=false;editingVersion=false;renderVersion(true);renderWorkspace(false);};
+$('revision').onchange=async()=>{if(dirty&&!confirm('放弃未保存编辑并切换版本？')){$('revision').value=selectedRevision.id;return;}selectedRevision=versions.find(v=>v.id===$('revision').value);if(selectedRevision&&selectedRevision.text===undefined){try{const full=await api(`/api/jobs/${current}/versions/${selectedRevision.id}`);selectedRevision=full;versions=versions.map(v=>v.id===full.id?full:v);}catch(e){return toast(e.message);}}dirty=false;editingVersion=false;renderVersion(true);renderWorkspace(false);await window.localProjectStore?.({...job,versions:versions.filter(v=>v.text!==undefined),cachedAt:new Date().toISOString()});};
 $('paragraphMode').onchange=()=>{if(dirty){$('paragraphMode').checked=!$('paragraphMode').checked;return toast('请先保存当前编辑再切换视图');}renderVersion(true);};
 $('editVersion').onclick=()=>{editingVersion=true;renderVersion(true);renderWorkspace(false);};
 $('save').onclick=async()=>{if(!selectedRevision)return;const id=current;let segments=[];let text=$('text').value;
   if($('paragraphMode').checked&&selectedSegments().length){segments=selectedSegments().map((p,i)=>({...p,text:$('paragraphs').querySelectorAll('textarea')[i].value}));text=segments.map(p=>p.text).join('\n\n');}
   try{const r=await api('/api/jobs/'+id+'/versions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({parent:selectedRevision.id,text,segments})});
-    if(current===id){dirty=false;editingVersion=false;await loadWorkspace(true);await refresh();toast('已保存为独立版本，原版本仍保留');}
+    if(current===id){await window.clearLocalDraft?.();dirty=false;editingVersion=false;await loadWorkspace(true);await refresh();toast('已保存为独立版本，原版本仍保留');}
   }catch(e){toast(e.message);}
 };
 $('saveProject').onclick=async()=>{try{await api('/api/jobs/'+current,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:$('projectTitle').value,topic:$('projectTopic').value,recorded_at:$('projectDate').value,diarization:$('diarization').checked})});await refresh();toast('讲座信息已保存');}catch(e){toast(e.message);}};
@@ -84,7 +87,7 @@ for(const [id,mode] of [['lightTidy','light'],['deepTidy','deep']])$(id).onclick
 $('showDiff').onclick=async()=>{if(!selectedRevision?.parent)return toast('此版本没有来源版本可比较');try{const d=await api(`/api/jobs/${current}/diff?before=${selectedRevision.parent}&after=${selectedRevision.id}`);$('diff').textContent=d.lines.join('\n')||'两个版本文本相同';$('diff').hidden=false;}catch(e){toast(e.message);}};
 for(const ext of ['txt','md'])$(ext).onclick=()=>{if(!selectedRevision)return;
   if(!connected){const names=jsonValue(job.speakers,{});const parts=selectedSegments();let text=selectedRevision.text;
-    if(parts.length&&($('includeTime').checked||$('includeSpeaker').checked))text=parts.map(p=>($('includeTime').checked?`[${duration(p.start/1000)}–${duration(p.end/1000)}] `:'')+($('includeSpeaker').checked&&p.speaker?(names[p.speaker]||p.speaker)+': ':'')+p.text).join('\n\n');
+    if(parts.length&&($('includeTime').checked||$('includeSpeaker').checked))text=parts.map(p=>($('includeTime').checked?(p.start==null||p.end==null?'[时间未知] ':`[${duration(p.start/1000)}–${duration(p.end/1000)}] `):'')+($('includeSpeaker').checked&&p.speaker?(names[p.speaker]||p.speaker)+': ':'')+p.text).join('\n\n');
     if(ext==='md')text='# '+(job.title||job.name)+'\n\n'+text;
     import(window.ltAsset('static/local-db.js')).then(db=>db.downloadBlob(new Blob(['\uFEFF'+text],{type:'text/plain'}),'transcript.'+ext));return;
   }
@@ -98,10 +101,27 @@ async function reloadConfiguration(){try{const c=await api('/api/config');$('con
 reloadConfiguration();
 window.addEventListener('online',()=>{reloadConfiguration();refresh().then(rows=>{if(rows?.length&&!current)openJob(rows.find(r=>r.status==='SUCCEEDED')?.id||rows[0].id);});});
 import(window.ltAsset('static/local-db.js')).then(db=>{
-  window.localProjectStore=value=>db.put('projects',value);
-  window.cacheProjectRows=async rows=>{for(const r of rows){const old=(await db.all('projects')).find(p=>p.id===r.id);await db.put('projects',{...old,...r});}};
-  window.showOfflineProjects=async()=>{if($('list').children.length)return;for(const p of await db.all('projects')){const b=document.createElement('button');b.className='item';b.textContent=(p.title||p.name)+' · 本地保存副本';b.onclick=()=>{current=p.id;job=p;loadedProject=p.id;versions=p.versions||[];selectedRevision=versions[0];$('revision').replaceChildren();for(const v of versions){const o=document.createElement('option');o.value=v.id;o.textContent=versionLabels[v.kind]||v.kind;$('revision').append(o);}$('empty').hidden=true;$('detail').hidden=false;$('name').textContent=p.title||p.name;dirty=false;editingVersion=false;renderVersion(true);renderWorkspace(true);};$('list').append(b);}};
-}).catch(()=>toast('浏览器本地缓存不可用；请使用项目备份保存重要数据'));
+  window.localProjectStore=async value=>{await db.merge('projects',value.id,value,(old,next)=>{const merged=new Map((old.versions||[]).map(v=>[v.id,v]));for(const v of next.versions||[])merged.set(v.id,v);return {...old,...next,versions:[...merged.values()].sort((a,b)=>b.created-a.created)};});};
+  window.cacheProjectRows=async rows=>{const old=new Map((await db.all('projects')).map(p=>[p.id,p]));for(const r of rows){const value={...r};delete value.server_time;const prior=old.get(r.id);if(!prior||Object.entries(value).some(([k,v])=>JSON.stringify(v)!==JSON.stringify(prior[k])))await db.merge('projects',value.id,value);}};
+  window.openOfflineProject=async id=>{const p=await db.get('projects',id);if(!p)return false;current=p.id;job=p;loadedProject=p.id;versions=p.versions||[];selectedRevision=versions[0];$('revision').replaceChildren();for(const v of versions){const o=document.createElement('option');o.value=v.id;o.textContent=versionLabels[v.kind]||v.kind;$('revision').append(o);}$('empty').hidden=true;$('detail').hidden=false;$('name').textContent=p.title||p.name;dirty=false;editingVersion=false;connected=false;renderVersion(true);renderWorkspace(true);$('connection').hidden=false;$('connection').textContent='正在查看本地副本 · 保存于 '+(p.cachedAt?new Date(p.cachedAt).toLocaleString():'未知时间');window.checkLocalDraft?.();return true;};
+  window.showOfflineProjects=async()=>{const cached=await db.all('projects');if(!cached.length)return;$('list').replaceChildren();for(const p of cached){const b=document.createElement('button');b.className='item';b.textContent=(p.title||p.name)+' · 本地副本';b.onclick=async()=>{if(dirty&&!confirm('当前编辑已自动保存为本地草稿，切换项目？'))return;await window.openOfflineProject(p.id);};$('list').append(b);}};
+  let draftTimer;let draft=null;
+  async function checkDraft(){if(!current)return;const id=current;const saved=await db.get('drafts',id);if(current!==id)return;draft=saved;$('restoreDraft').hidden=!saved;$('draftStatus').textContent=saved?'有未提交草稿 · '+new Date(saved.saved).toLocaleString():'';}
+  window.checkLocalDraft=checkDraft;
+  window.clearLocalDraft=async()=>{clearTimeout(draftTimer);const saved=await db.get('drafts',current);if(saved){saved.source=null;saved.editing=false;saved.text='';saved.paragraphs=[];await db.put('drafts',saved);}draft=saved;$('restoreDraft').hidden=!saved;$('draftStatus').textContent='稿件已提交；其他未提交字段仍保留本地草稿';};
+  document.getElementById('detail').addEventListener('input',()=>{
+    if(!current)return;clearTimeout(draftTimer);
+    const fields={};for(const id of ['projectTitle','projectTopic','projectDate','vocabBackground','vocabContext'])fields[id]=$(id).value;
+    const snapshot={id:current,saved:new Date().toISOString(),source:selectedRevision,editing:editingVersion,text:$('text').value,paragraphs:[...$('paragraphs').querySelectorAll('textarea')].map(t=>t.value),fields,
+      vocab:[...$('vocabEntries').children].map(row=>{const e={...row._entry};row.querySelectorAll('input').forEach(i=>e[i.dataset.key]=i.value);return e;}),speakers:[...$('speakerEntries').querySelectorAll('input')].map(i=>[i.dataset.speaker,i.value]),diarization:$('diarization').checked};
+    draftTimer=setTimeout(()=>db.put('drafts',snapshot).then(()=>{$('draftStatus').textContent='未提交编辑已保存到当前设备';}).catch(()=>toast('本地草稿保存失败，请立即保存或导出编辑内容')),400);
+  });
+  $('restoreDraft').onclick=()=>{if(!draft)return;const saved=draft;if(saved.source){selectedRevision=saved.source;editingVersion=saved.editing;renderVersion(true);$('text').value=saved.text;$('paragraphs').querySelectorAll('textarea').forEach((t,i)=>t.value=saved.paragraphs[i]??t.value);}
+    for(const [id,value] of Object.entries(saved.fields))$(id).value=value;$('diarization').checked=saved.diarization;$('vocabEntries').replaceChildren();for(const e of saved.vocab)vocabRow(e);vocabularyDirty=true;
+    for(const [id,name] of saved.speakers){const input=[...$('speakerEntries').querySelectorAll('input')].find(i=>i.dataset.speaker===id);if(input)input.value=name;}
+    dirty=true;renderWorkspace(false);$('draftStatus').textContent='已恢复草稿，请分别保存稿件、讲座信息或词汇修改';};
+  checkDraft();
+}).catch(()=>toast('浏览器本地缓存不可用，请导出重要数据'));
 if('serviceWorker' in navigator)navigator.serviceWorker.register(window.ltAsset('sw.js')).catch(()=>toast('离线资源缓存未能启用'));
 $('deviceCheck').onclick=async()=>{
   const types=['audio/mp4','audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus'];
@@ -121,4 +141,8 @@ if(window.ltStaticHost){
   $('saveBackend').onclick=()=>{try{window.ltSaveBackend($('backendAddress').value);location.reload();}catch(e){toast(e.message);}};
   $('disconnectBackend').onclick=()=>{window.ltSaveBackend('');location.reload();};
 }
-setInterval(()=>loadWorkspace(),5000);
+async function scheduleWorkspace(){if(!document.hidden&&connected)await loadWorkspace();setTimeout(scheduleWorkspace,job?.active||aiRunning?5000:20000);}
+setTimeout(scheduleWorkspace,5000);
+$('stopWaiting').onclick=async()=>{try{const r=await api(`/api/jobs/${current}/stop-waiting`,{method:'POST'});toast(r.message);}catch(e){toast(e.message);}};
+$('showRuns').onclick=async()=>{try{$('modelRuns').textContent=JSON.stringify(await api(`/api/jobs/${current}/runs`),null,2);$('modelRuns').hidden=false;}catch(e){toast(e.message);}};
+$('deleteProject').onclick=async()=>{if(!confirm('删除当前项目的音频、所有稿件和调用记录？请先确认已导出备份，此操作无法撤销。'))return;try{await api(`/api/jobs/${current}`,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:current})});const db=await import(window.ltAsset('static/local-db.js'));await db.remove('projects',current);await db.remove('drafts',current);current=null;job=null;selectedRevision=null;$('detail').hidden=true;$('empty').hidden=false;dirty=false;await refresh();}catch(e){toast(e.message);}};

@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from services import transcripts as T,language
-from services import bridge
+from services import bridge,audio
 from fastapi.middleware.cors import CORSMiddleware
 
 ROOT = Path(__file__).resolve().parent
@@ -28,7 +28,10 @@ DATA = ROOT / 'data'
 MODEL = 'qwen-audio-3.1-asr-flash-filetrans'
 MAX_AUDIO_BYTES = 1_000_000_000
 FORMATS = {'aac','amr','avi','flac','flv','m4a','mkv','mov','mp3','mp4','mpeg','ogg','opus','wav','webm','wma','wmv'}
-POOL = ThreadPoolExecutor(max_workers=2)
+POOL = ThreadPoolExecutor(max_workers=2,thread_name_prefix='asr')
+AI_POOL = ThreadPoolExecutor(max_workers=2,thread_name_prefix='llm')
+CANCEL = set()
+MAX_WAIT_SECONDS = 6*3600
 LOCK = threading.Lock()
 ACTIVE = set()
 BUSY = {'WAITING_UPLOAD','UPLOADING','SUBMITTING','PENDING','RUNNING','FETCHING_RESULT'}
@@ -90,7 +93,9 @@ def ensure_vocabulary(jid,force=False):
     with db() as c:c.execute('INSERT INTO actions VALUES(?,?,?,?,?,?,?)',(aid,jid,'vocabulary:auto','RUNNING',None,time.time(),None))
     try:
         result=language.complete(config(),language.VOCAB_SYSTEM,json.dumps({'topic':job['topic']},ensure_ascii=False))
-        update(jid,vocab=json.dumps(T.vocabulary(result),ensure_ascii=False),vocab_status='词汇已生成，不需要额外确认')
+        current=get_job(jid)
+        if current.get('topic')==job.get('topic') and current.get('vocab')==job.get('vocab') and not (current.get('vocab_status') or '').startswith('已保存'):
+            update(jid,vocab=json.dumps(T.vocabulary(result),ensure_ascii=False),vocab_status='词汇已生成，不需要额外确认')
         with db() as c:c.execute("UPDATE actions SET status='SUCCEEDED',finished=? WHERE id=?",(time.time(),aid))
     except Exception:
         update(jid,vocab_status='词汇生成未完成，转录不受影响；可检查 LLM 配置后重试')
@@ -128,8 +133,8 @@ class ProgressFile:
     def __getattr__(self, name):
         return getattr(self.source, name)
 
-def temporary_upload(client, cfg, jid, name):
-    path = DATA / (jid+'.audio')
+def temporary_upload(client, cfg, jid, name, path=None):
+    path = path or DATA / (jid+'.audio')
     total = path.stat().st_size
     if total > MAX_AUDIO_BYTES:
         raise ValueError('临时上传上限 1 GB，请使用更小的音频；原音频仍保留在本机')
@@ -167,15 +172,22 @@ def worker(jid):
         with db() as c:c.execute('INSERT INTO actions VALUES(?,?,?,?,?,?,?)',(call_id,jid,'filetrans:'+MODEL,'RUNNING',None,time.time(),None))
         cfg = config()
         job = get_job(jid)
+        if jid in CANCEL:raise ValueError('已取消本地排队，尚未提交云端识别')
+        prepared=DATA/(jid+'.asr.flac')
         if not job['task']:
+            update(jid,status='WAITING_UPLOAD',error='正在本地校验音频并准备完整声道识别副本')
+            info=audio.prepare(DATA/(jid+'.audio'),prepared)
+            if prepared.stat().st_size>MAX_AUDIO_BYTES:raise ValueError('识别副本超过临时上传1GB限制，请先分段')
             ensure_vocabulary(jid)
             job=get_job(jid)
         base = f"https://{cfg['workspace_id']}.{cfg['region']}.maas.aliyuncs.com/api/v1"
         headers = {'Authorization':'Bearer '+cfg['api_key']}
         with httpx.Client(timeout=60,follow_redirects=False) as client:
             if not job['task']:
+                if jid in CANCEL:raise ValueError('已取消本地等待，尚未提交云端识别')
                 update(jid,status='UPLOADING',error=None)
-                url = temporary_upload(client,cfg,jid,job['name'])
+                url = temporary_upload(client,cfg,jid,'recognition.flac',prepared)
+                if jid in CANCEL:raise ValueError('已取消本地等待，尚未提交云端识别')
                 update(jid,status='SUBMITTING',recognition_started=time.time())
                 words,context=T.hints(json.loads(job.get('vocab') or '{}'))
                 parameters={'channel_id':[0]}
@@ -184,16 +196,22 @@ def worker(jid):
                 input_data={'file_urls':[url]}
                 if context:input_data['context']=context
                 # Do not retry submission timeouts: they may already have created a billed task.
+                request_snapshot={'model':MODEL,'input':{'context':context},'parameters':parameters,'vocabulary_snapshot':json.loads(job.get('vocab') or '{}'),'audio':info}
+                with db() as c:c.execute('INSERT INTO model_runs VALUES(?,?,?,?,?,?,?,?)',(call_id,jid,None,None,MODEL,json.dumps(request_snapshot,ensure_ascii=False),None,time.time()))
                 r = client.post(base+'/services/audio/asr/transcription',headers={**headers,'X-DashScope-Async':'enable','X-DashScope-OssResourceResolve':'enable'},json={'model':MODEL,'input':input_data,'parameters':parameters})
                 r.raise_for_status()
                 task = r.json()['output']['task_id']
                 update(jid,task=task,status='PENDING')
+                with db() as c:c.execute('UPDATE model_runs SET task=? WHERE id=?',(task,call_id))
             else:
                 task = job['task']
                 update(jid,status='PENDING',error=None,finished=None,
                        recognition_started=job.get('recognition_started') or time.time())
             failures = 0
+            deadline=time.monotonic()+MAX_WAIT_SECONDS
             while True:
+                if jid in CANCEL:raise ValueError('已停止本地等待；云端任务可能仍在运行，可继续查询原任务，不会重新提交')
+                if time.monotonic()>deadline:raise ValueError('查询超过六小时，已暂停等待；可继续查询原任务')
                 try:
                     r = client.get(base+'/tasks/'+task,headers=headers)
                     r.raise_for_status()
@@ -213,15 +231,19 @@ def worker(jid):
                         result_response.raise_for_status()
                         raw = result_response.json()
                         segments=T.paragraphs(raw,namespace=task)
-                        with db() as c:T.add(c,jid,'filetrans',extract(raw),segments,model=MODEL)
                         names=json.loads(job.get('speakers') or '{}')
                         run_speakers=[]
                         for segment in segments:
                             sid=segment['speaker']
                             if sid and sid not in run_speakers:run_speakers.append(sid)
                             if sid and sid not in names:names[sid]=f'Speaker {run_speakers.index(sid)+1}'
-                        update(jid,speakers=json.dumps(names,ensure_ascii=False))
-                        update(jid,original=extract(raw),raw=json.dumps(raw,ensure_ascii=False),status='SUCCEEDED',error=None,finished=time.time())
+                        with db() as c:
+                            rid=T.add(c,jid,'filetrans',extract(raw),segments,model=MODEL)
+                            if not c.execute('SELECT 1 FROM model_runs WHERE task=? AND job=?',(task,jid)).fetchone():
+                                c.execute('INSERT INTO model_runs VALUES(?,?,?,?,?,?,?,?)',(call_id,jid,None,task,MODEL,'{}',None,time.time()))
+                            c.execute('UPDATE model_runs SET revision=?,raw=? WHERE task=? AND job=?',(rid,json.dumps(raw,ensure_ascii=False),task,jid))
+                            c.execute('UPDATE jobs SET speakers=?,original=?,raw=?,status=?,error=NULL,finished=? WHERE id=?',
+                                      (json.dumps(names,ensure_ascii=False),extract(raw),json.dumps(raw,ensure_ascii=False),'SUCCEEDED',time.time(),jid))
                         return
                     if state in ('FAILED','CANCELED','UNKNOWN'):
                         update(jid,status='FAILED',finished=time.time(),error='云端任务失败：'+str(out.get('code',state)))
@@ -243,8 +265,9 @@ def worker(jid):
     finally:
         j=get_job(jid)
         with db() as c:c.execute('UPDATE actions SET status=?,error=?,finished=? WHERE id=?',('SUCCEEDED' if j['status']=='SUCCEEDED' else 'FAILED',j['error'],time.time(),call_id))
+        (DATA/(jid+'.asr.flac')).unlink(missing_ok=True)
         with LOCK:
-            ACTIVE.discard(jid)
+            ACTIVE.discard(jid);CANCEL.discard(jid)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -311,7 +334,7 @@ def configuration():
 def public_job(row, summary=False):
     hidden = {'object_key','raw'}
     if summary:
-        hidden |= {'original','edited','task'}
+        hidden |= {'original','edited','task','vocab','speakers'}
     result = {k:v for k,v in row.items() if k not in hidden}
     with LOCK:
         result['active'] = row['id'] in ACTIVE
@@ -319,9 +342,9 @@ def public_job(row, summary=False):
     return result
 
 @app.get('/api/jobs')
-def jobs():
+def jobs(limit:int=50,offset:int=0):
     with db() as c:
-        rows = [dict(r) for r in c.execute('SELECT * FROM jobs ORDER BY created DESC')]
+        rows = [dict(r) for r in c.execute('SELECT id,name,status,created,title,topic,recorded_at,storage_mode,upload_sent,upload_total,upload_completed,upload_started,recognition_started,finished,last_polled,error,cleanup FROM jobs ORDER BY created DESC LIMIT ? OFFSET ?',(min(200,max(1,limit)),max(0,offset)))]
     return [public_job(r,summary=True) for r in rows]
 
 @app.get('/api/jobs/{jid}')
@@ -362,6 +385,7 @@ def start(jid: str,force:bool=False):
         return {'ok':True}
     if job['status']=='INTERRUPTED' and not job['task']:
         raise HTTPException(409,'提交结果不确定，为避免重复计费，请先在百炼控制台核对任务。保留原音频后可重新导入。')
+    if not (DATA/(jid+'.audio')).exists():raise HTTPException(400,'完整音频尚未保存')
     if (force or not job['task']) and (DATA/(jid+'.audio')).stat().st_size>MAX_AUDIO_BYTES:
         raise HTTPException(413,'临时上传上限 1 GB；这份旧音频仍安全保留在本机，请使用更小的文件')
     try:
@@ -376,6 +400,7 @@ def start(jid: str,force:bool=False):
             values.update(storage_mode='temporary',upload_sent=0,upload_total=0,upload_completed=0,upload_started=None,recognition_started=None,last_polled=None)
             if force:values['task']=None
         update(jid,**values)
+        CANCEL.discard(jid)
         ACTIVE.add(jid)
     try:
         POOL.submit(worker,jid)
@@ -414,6 +439,8 @@ install(app,sys.modules[__name__])
 from services.streaming import install as install_streaming
 install_streaming(app,sys.modules[__name__])
 bridge.install(app,sys.modules[__name__])
+from services.transfers import install as install_transfers
+install_transfers(app,sys.modules[__name__])
 if FRONTEND_ORIGIN:
     app.add_middleware(CORSMiddleware,allow_origins=[FRONTEND_ORIGIN],allow_credentials=True,
-                       allow_methods=['GET','POST','PUT','PATCH'],allow_headers=['Content-Type','Authorization'])
+                       allow_methods=['GET','POST','PUT','PATCH','DELETE'],allow_headers=['Content-Type','Authorization','X-Chunk-SHA256'])

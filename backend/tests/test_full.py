@@ -54,7 +54,7 @@ class FullTests(unittest.TestCase):
         self.assertEqual((R.DATA/(first+'.audio')).read_bytes(),b'original')
     def test_tidy_only_on_explicit_post_and_new_version(self):
         rid=self.version()
-        with patch.object(language,'tidy',return_value='整理文本') as tidy,patch.object(R,'config',return_value={'llm_model':'qa'}),patch.object(R.POOL,'submit') as pool:
+        with patch.object(language,'tidy',return_value='整理文本') as tidy,patch.object(R,'config',return_value={'llm_model':'qa'}),patch.object(R.AI_POOL,'submit') as pool:
             self.client.get('/api/jobs');tidy.assert_not_called()
             response=self.client.post(f'/api/jobs/{self.jid}/tidy',json={'version':rid,'mode':'light'});self.assertEqual(response.status_code,200)
             pool.call_args.args[0]()

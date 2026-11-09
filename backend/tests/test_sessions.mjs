@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
+const source=await readFile(new URL('../static/recording-session.js',import.meta.url),'utf8');
+const {RecordingSession}=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
+const realTimer=globalThis.setTimeout;const callbacks=[];globalThis.setTimeout=fn=>{callbacks.push(fn);return 1;};
+let oldClosed=0,newClosed=0;const old=new RecordingSession({id:'old'});old.socket={readyState:1,send(){},close(){oldClosed++;}};old.finish();
+const next=new RecordingSession({id:'new'});next.socket={readyState:1,send(){},close(){newClosed++;}};callbacks[0]();assert.equal(oldClosed,1);assert.equal(newClosed,0);
+const messages=[];next.ready=true;next.socket.bufferedAmount=0;next.socket.send=value=>messages.push(value);next.buffer(new ArrayBuffer(2),4500);next.drain();assert.deepEqual(JSON.parse(messages[0]),{type:'audio-start',offset:4500});assert.equal(messages.length,2);
+for(let i=0;i<101;i++)next.buffer(new ArrayBuffer(2),i*100);assert.equal(next.frames.length,100);assert.equal(next.meta.realtimeGap,true);assert.equal(old.meta.id,'old');globalThis.setTimeout=realTimer;
+console.log('3 session regressions passed: lifecycle isolation, first-frame offset, bounded buffer');

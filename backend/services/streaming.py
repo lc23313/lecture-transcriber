@@ -39,14 +39,19 @@ def install(app,R):
                 if first.get('header',{}).get('event')!='task-started':raise ValueError('实时识别未能启动，请检查模型权限')
                 await ws.send_json({'type':'ready','session':session})
                 async def audio():
+                    nonlocal offset
+                    started=False
                     while True:
                         msg=await ws.receive()
                         if msg['type']=='websocket.disconnect':return
                         if msg.get('bytes') is not None:
                             if len(msg['bytes'])>64000:raise ValueError('实时音频包过大')
+                            started=True
                             await upstream.send(msg['bytes'])
                         elif msg.get('text'):
                             value=json.loads(msg['text'])
+                            if value.get('type')=='audio-start' and not started:
+                                offset=max(0,int(value.get('offset',0)))
                             if value.get('type')=='finish':
                                 await upstream.send(json.dumps({'header':{'action':'finish-task','task_id':task,'streaming':'duplex'},'payload':{'input':{}}}))
                                 await asyncio.sleep(20);return
